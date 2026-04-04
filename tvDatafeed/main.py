@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import enum
 import json
@@ -5,10 +7,14 @@ import logging
 import random
 import re
 import string
+import time
+from typing import Optional
+
 import pandas as pd
-from websocket import create_connection
 import requests
-import json
+from websocket import create_connection, WebSocket
+
+from tvDatafeed.config import SIGN_IN_URL, SEARCH_URL, WS_URL, WS_TIMEOUT, RECV_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +36,15 @@ class Interval(enum.Enum):
 
 
 class TvDatafeed:
-    __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
-    __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
-    __ws_timeout = 5
+    __re_series_data = re.compile(r'"s":\[(.+?)\}\]')
+    __re_bar_split = re.compile(r"\[|:|,|\]")
 
     def __init__(
         self,
-        username: str = None,
-        password: str = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
     ) -> None:
         """Create TvDatafeed object
 
@@ -48,9 +53,7 @@ class TvDatafeed:
             password (str, optional): tradingview password. Defaults to None.
         """
 
-        self.ws_debug = False
-
-        self.token = self.__auth(username, password)
+        self.token: str = self.__auth(username, password)
 
         if self.token is None:
             self.token = "unauthorized_user_token"
@@ -58,11 +61,10 @@ class TvDatafeed:
                 "you are using nologin method, data you access may be limited"
             )
 
-        self.ws = None
-        self.session = self.__generate_session()
-        self.chart_session = self.__generate_chart_session()
+        # ws, session, chart_session are now created per get_hist() call
+        # for thread safety (no shared mutable state)
 
-    def __auth(self, username, password):
+    def __auth(self, username: Optional[str], password: Optional[str]) -> Optional[str]:
 
         if (username is None or password is None):
             token = None
@@ -73,22 +75,25 @@ class TvDatafeed:
                     "remember": "on"}
             try:
                 response = requests.post(
-                    url=self.__sign_in_url, data=data, headers=self.__signin_headers)
+                    url=SIGN_IN_URL, data=data, headers=self.__signin_headers)
                 token = response.json()['user']['auth_token']
-            except Exception as e:
-                logger.error('error while signin')
+            except (requests.RequestException, KeyError, ValueError) as e:
+                logger.error('error while signin: %s', e)
                 token = None
 
         return token
 
-    def __create_connection(self):
-        logging.debug("creating websocket connection")
-        self.ws = create_connection(
-            "wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout
+    @staticmethod
+    def __create_connection() -> WebSocket:
+        logger.debug("creating websocket connection")
+        return create_connection(
+            WS_URL,
+            headers=TvDatafeed.__ws_headers,
+            timeout=WS_TIMEOUT,
         )
 
     @staticmethod
-    def __filter_raw_message(text):
+    def __filter_raw_message(text: str) -> Optional[tuple[str, str]]:
         try:
             found = re.search('"m":"(.+?)",', text).group(1)
             found2 = re.search('"p":(.+?"}"])}', text).group(1)
@@ -96,50 +101,42 @@ class TvDatafeed:
             return found, found2
         except AttributeError:
             logger.error("error in filter_raw_message")
+            return None
 
     @staticmethod
-    def __generate_session():
-        stringLength = 12
+    def __generate_id(prefix: str) -> str:
         letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
-        return "qs_" + random_string
+        random_string = "".join(random.choice(letters) for _ in range(12))
+        return prefix + random_string
 
     @staticmethod
-    def __generate_chart_session():
-        stringLength = 12
-        letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
-        return "cs_" + random_string
-
-    @staticmethod
-    def __prepend_header(st):
+    def __prepend_header(st: str) -> str:
         return "~m~" + str(len(st)) + "~m~" + st
 
     @staticmethod
-    def __construct_message(func, param_list):
+    def __construct_message(func: str, param_list: list) -> str:
         return json.dumps({"m": func, "p": param_list}, separators=(",", ":"))
 
-    def __create_message(self, func, paramList):
-        return self.__prepend_header(self.__construct_message(func, paramList))
-
-    def __send_message(self, func, args):
-        m = self.__create_message(func, args)
-        if self.ws_debug:
-            print(m)
-        self.ws.send(m)
+    @staticmethod
+    def __create_message(func: str, paramList: list) -> str:
+        return TvDatafeed.__prepend_header(TvDatafeed.__construct_message(func, paramList))
 
     @staticmethod
-    def __create_df(raw_data, symbol):
+    def __send_message(ws: WebSocket, func: str, args: list) -> None:
+        m = TvDatafeed.__create_message(func, args)
+        logger.debug(m)
+        ws.send(m)
+
+    @staticmethod
+    def __create_df(raw_data: str, symbol: str) -> Optional[pd.DataFrame]:
         try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
+            out = TvDatafeed.__re_series_data.search(raw_data).group(1)
             x = out.split(',{"')
             data = list()
             volume_data = True
 
             for xi in x:
-                xi = re.split("\[|:|,|\]", xi)
+                xi = TvDatafeed.__re_bar_split.split(xi)
                 ts = datetime.datetime.fromtimestamp(float(xi[4]))
 
                 row = [ts]
@@ -153,7 +150,7 @@ class TvDatafeed:
                     try:
                         row.append(float(xi[i]))
 
-                    except ValueError:
+                    except (ValueError, IndexError):
                         volume_data = False
                         row.append(0.0)
                         logger.debug('no volume data')
@@ -168,9 +165,10 @@ class TvDatafeed:
             return data
         except AttributeError:
             logger.error("no data, please check the exchange and symbol")
+            return None
 
     @staticmethod
-    def __format_symbol(symbol, exchange, contract: int = None):
+    def __format_symbol(symbol: str, exchange: str, contract: Optional[int] = None) -> str:
 
         if ":" in symbol:
             pass
@@ -191,9 +189,9 @@ class TvDatafeed:
         exchange: str = "NSE",
         interval: Interval = Interval.in_daily,
         n_bars: int = 10,
-        fut_contract: int = None,
+        fut_contract: Optional[int] = None,
         extended_session: bool = False,
-    ) -> pd.DataFrame:
+    ) -> Optional[pd.DataFrame]:
         """get historical data
 
         Args:
@@ -213,92 +211,105 @@ class TvDatafeed:
 
         interval = interval.value
 
-        self.__create_connection()
+        # Per-call local state for thread safety
+        session = self.__generate_id("qs_")
+        chart_session = self.__generate_id("cs_")
+        ws = self.__create_connection()
 
-        self.__send_message("set_auth_token", [self.token])
-        self.__send_message("chart_create_session", [self.chart_session, ""])
-        self.__send_message("quote_create_session", [self.session])
-        self.__send_message(
-            "quote_set_fields",
-            [
-                self.session,
-                "ch",
-                "chp",
-                "current_session",
-                "description",
-                "local_description",
-                "language",
-                "exchange",
-                "fractional",
-                "is_tradable",
-                "lp",
-                "lp_time",
-                "minmov",
-                "minmove2",
-                "original_name",
-                "pricescale",
-                "pro_name",
-                "short_name",
-                "type",
-                "update_mode",
-                "volume",
-                "currency_code",
-                "rchp",
-                "rtc",
-            ],
-        )
+        try:
+            self.__send_message(ws, "set_auth_token", [self.token])
+            self.__send_message(ws, "chart_create_session", [chart_session, ""])
+            self.__send_message(ws, "quote_create_session", [session])
+            self.__send_message(
+                ws,
+                "quote_set_fields",
+                [
+                    session,
+                    "ch",
+                    "chp",
+                    "current_session",
+                    "description",
+                    "local_description",
+                    "language",
+                    "exchange",
+                    "fractional",
+                    "is_tradable",
+                    "lp",
+                    "lp_time",
+                    "minmov",
+                    "minmove2",
+                    "original_name",
+                    "pricescale",
+                    "pro_name",
+                    "short_name",
+                    "type",
+                    "update_mode",
+                    "volume",
+                    "currency_code",
+                    "rchp",
+                    "rtc",
+                ],
+            )
 
-        self.__send_message(
-            "quote_add_symbols", [self.session, symbol,
-                                  {"flags": ["force_permission"]}]
-        )
-        self.__send_message("quote_fast_symbols", [self.session, symbol])
+            self.__send_message(
+                ws, "quote_add_symbols", [session, symbol,
+                                      {"flags": ["force_permission"]}]
+            )
+            self.__send_message(ws, "quote_fast_symbols", [session, symbol])
 
-        self.__send_message(
-            "resolve_symbol",
-            [
-                self.chart_session,
-                "symbol_1",
-                '={"symbol":"'
-                + symbol
-                + '","adjustment":"splits","session":'
-                + ('"regular"' if not extended_session else '"extended"')
-                + "}",
-            ],
-        )
-        self.__send_message(
-            "create_series",
-            [self.chart_session, "s1", "s1", "symbol_1", interval, n_bars],
-        )
-        self.__send_message("switch_timezone", [
-                            self.chart_session, "exchange"])
+            self.__send_message(
+                ws,
+                "resolve_symbol",
+                [
+                    chart_session,
+                    "symbol_1",
+                    '={"symbol":"'
+                    + symbol
+                    + '","adjustment":"splits","session":'
+                    + ('"regular"' if not extended_session else '"extended"')
+                    + "}",
+                ],
+            )
+            self.__send_message(
+                ws,
+                "create_series",
+                [chart_session, "s1", "s1", "symbol_1", interval, n_bars],
+            )
+            self.__send_message(ws, "switch_timezone", [
+                                chart_session, "exchange"])
 
-        raw_data = ""
+            raw_data_parts: list[str] = []
 
-        logger.debug(f"getting data for {symbol}...")
-        while True:
-            try:
-                result = self.ws.recv()
-                raw_data = raw_data + result + "\n"
-            except Exception as e:
-                logger.error(e)
-                break
+            logger.debug(f"getting data for {symbol}...")
+            deadline = time.monotonic() + RECV_TIMEOUT
+            while time.monotonic() < deadline:
+                try:
+                    result = ws.recv()
+                    raw_data_parts.append(result)
+                except (OSError, TimeoutError) as e:
+                    logger.error(e)
+                    break
 
-            if "series_completed" in result:
-                break
+                if "series_completed" in result:
+                    break
+            else:
+                logger.error(f"recv timeout exceeded for {symbol}")
 
-        return self.__create_df(raw_data, symbol)
+            raw_data = "\n".join(raw_data_parts)
+            return self.__create_df(raw_data, symbol)
+        finally:
+            ws.close()
 
-    def search_symbol(self, text: str, exchange: str = ''):
-        url = self.__search_url.format(text, exchange)
+    def search_symbol(self, text: str, exchange: str = '') -> list[dict]:
+        url = SEARCH_URL.format(text, exchange)
 
-        symbols_list = []
+        symbols_list: list[dict] = []
         try:
             resp = requests.get(url)
 
             symbols_list = json.loads(resp.text.replace(
                 '</em>', '').replace('<em>', ''))
-        except Exception as e:
+        except (requests.RequestException, json.JSONDecodeError) as e:
             logger.error(e)
 
         return symbols_list

@@ -1,11 +1,15 @@
-import threading, queue, time, logging
-import tvDatafeed 
+import logging
+import queue
+import threading
+import time
+
+import tvDatafeed
 from datetime import datetime as dt
 from dateutil.relativedelta import relativedelta as rd
 
-logger = logging.getLogger(__name__)
+from tvDatafeed.config import RETRY_LIMIT
 
-RETRY_LIMIT=50 # max number of retries to get valid data from tvDatafeed; TODO: think about creating a conf file for such parameters
+logger = logging.getLogger(__name__)
 
 class TvDatafeedLive(tvDatafeed.TvDatafeed):
     """                 
@@ -61,16 +65,10 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
         
         def _next_trigger_dt(self):
             # Get the next closest expiry datetime
-            if not self.values(): # if Seis list is empty
+            if not self.values():
                 return None
-            
-            interval_dt_list=[]
-            for values in self.values():
-                interval_dt_list.append(values[1])
-            
-            interval_dt_list.sort()
 
-            return interval_dt_list[0]
+            return min(v[1] for v in self.values())
 
         def get_seis(self, symbol, exchange, interval):
             # Returns Seis object listed in SAT based on
@@ -235,35 +233,36 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
             If provided symbol and exchange combination is
             not listed on TradingView
         '''
+        if seis := self._sat.get_seis(symbol, exchange, interval): # if Seis with such parameters already exists then simply return that
+            return seis
+
         if self._args_invalid(symbol, exchange):
             raise ValueError("Provided symbol and exchange combination is not listed in TradingView")
         
-        if seis := self._sat.get_seis(symbol, exchange, interval): # if Seis with such parameters already exists then simply return that
-            return seis
-        
         new_seis=tvDatafeed.Seis(symbol, exchange, interval)
         
-        if self._lock.acquire(timeout=timeout) is False:
+        if not self._lock.acquire(timeout=timeout):
             return False
-        
-        new_seis.tvdatafeed=self
-        
-        # if this seis is already in list 
-        if new_seis in self._sat:
-            return self._sat.get_seis(symbol, exchange, interval)
-        
-        # add to interval group - if interval group does not exists then create one
-        interval_key=new_seis.interval.value
-        if interval_key not in self._sat.intervals():
-            # get last bar update datetime value for the Seis
-            ticker_data=super().get_hist(new_seis.symbol, new_seis.exchange, new_seis.interval, n_bars=2) # get ticker data bar for this symbol from TradingView
-            update_dt=ticker_data.index.to_pydatetime()[0] # extract datetime of when this bar was produced/released
-            # append this seis into SAT
-            self._sat.append(new_seis, update_dt)
-        else:
-            self._sat.append(new_seis)
-        
-        self._lock.release()
+
+        try:
+            # if this seis is already in list (authoritative check under lock)
+            if new_seis in self._sat:
+                return self._sat.get_seis(symbol, exchange, interval)
+
+            new_seis.tvdatafeed=self
+
+            # add to interval group - if interval group does not exists then create one
+            interval_key=new_seis.interval.value
+            if interval_key not in self._sat.intervals():
+                # get last bar update datetime value for the Seis
+                ticker_data=super().get_hist(new_seis.symbol, new_seis.exchange, new_seis.interval, n_bars=2) # get ticker data bar for this symbol from TradingView
+                update_dt=ticker_data.index.to_pydatetime()[0] # extract datetime of when this bar was produced/released
+                # append this seis into SAT
+                self._sat.append(new_seis, update_dt)
+            else:
+                self._sat.append(new_seis)
+        finally:
+            self._lock.release()
         
         if self._main_thread is None: # if main thread is not running then start 
             self._main_thread = threading.Thread(name="main_loop", target=self._main_loop)
@@ -296,22 +295,26 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
         if seis not in self._sat:
             raise ValueError("Seis is not listed")
         
-        if self._lock.acquire(timeout=timeout) is False:
+        if not self._lock.acquire(timeout=timeout):
             return False
-        # close all the callback threads for this Seis
-        for consumer in seis.get_consumers():
-            consumer.put(None) # None signals closing for the callback thread
-                
-        # remove Seis from MAR list
-        self._sat.discard(seis)
-        del seis.tvdatafeed
-        
-        # if SAT list empty now then close down main loop
-        if not self._sat:
-            self._sat.quit()
-        
-        self._lock.release()
-        
+
+        try:
+            # collect consumers to stop outside lock
+            consumers_to_stop = list(seis.get_consumers())
+
+            self._sat.discard(seis)
+            del seis.tvdatafeed
+
+            # if SAT list empty now then close down main loop
+            if not self._sat:
+                self._sat.quit()
+        finally:
+            self._lock.release()
+
+        # stop consumers outside lock to avoid deadlock during join
+        for consumer in consumers_to_stop:
+            consumer.stop()
+
         return True
     
     def new_consumer(self, seis, callback, timeout=-1):
@@ -345,13 +348,16 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
         
         # new consumer to hold callback related info
         consumer=tvDatafeed.Consumer(seis, callback)
-        if self._lock.acquire(timeout=timeout) is False:
+        if not self._lock.acquire(timeout=timeout):
             return False
-        seis.add_consumer(consumer)     
-        consumer.start()  
-        self._lock.release()
-        
-        return consumer 
+
+        try:
+            seis.add_consumer(consumer)
+            consumer.start()
+        finally:
+            self._lock.release()
+
+        return consumer
     
     def del_consumer(self, consumer, timeout=-1): 
         '''
@@ -370,12 +376,15 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
         boolean
             True if successful, False if timed out.
         '''
-        if self._lock.acquire(timeout=timeout) is False:
+        if not self._lock.acquire(timeout=timeout):
             return False
-        consumer.seis.pop_consumer(consumer)
-        consumer.stop()
-        self._lock.release()
-        
+
+        try:
+            consumer.seis.pop_consumer(consumer)
+            consumer.stop()
+        finally:
+            self._lock.release()
+
         return True
         
     def _main_loop(self):
@@ -397,36 +406,57 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
         # and if still fail then log the event (critical) and close
         # down the consumer threads and the main loop itself.
         
-        while self._sat.wait(): # waits until soonest expiry and returns True; returns False if closed                     
+        while self._sat.wait(): # waits until soonest expiry and returns True; returns False if closed
+            failed_seises = []
             with self._lock:
                 for interval in self._sat.get_expired(): # returns a list of intervals that have expired
-                    for seis in self._sat[interval]: # go through all the seises in this interval group 
-                        for _ in range(0, RETRY_LIMIT): # re-try maximum of RETRY_LIMIT times
-                            data=super().get_hist(seis.symbol, seis.exchange, interval=seis.interval, n_bars=2) # get_hist returns bars starting with currently open so need to read 2 to get first closed
+                    for seis in self._sat[interval]: # go through all the seises in this interval group
+                        data = None
+                        for attempt in range(RETRY_LIMIT): # re-try maximum of RETRY_LIMIT times
+                            try:
+                                data=super().get_hist(seis.symbol, seis.exchange, interval=seis.interval, n_bars=2) # get_hist returns bars starting with currently open so need to read 2 to get first closed
+                            except Exception as e:
+                                logger.error("Error fetching data for %s/%s: %s", seis.symbol, seis.exchange, e)
+                                data = None
+
                             if data is not None: # check that we did get any data
-                                if seis.is_new_data(data): # check that it is new data not old 
-                                    data=data.drop(labels=data.index[1]) # drop the row (last) which has yet un-closed bar data 
+                                if seis.is_new_data(data): # check that it is new data not old
+                                    data=data.drop(labels=data.index[1]) # drop the row (last) which has yet un-closed bar data
                                     break
-                            
-                            time.sleep(0.1) # little time before retrying
-                        else: # limit reached, print an error into logs and gracefully shut down the main loop and consumer threads
-                            self._sat.quit()
-                            logger.critical("Failed to retrieve new data from TradingView")
-                        
+
+                            time.sleep(min(0.1 * (2 ** attempt), 5.0)) # exponential backoff
+                        else: # limit reached — remove this seis, don't kill entire feed
+                            logger.critical("Failed to retrieve new data for %s/%s after %d retries", seis.symbol, seis.exchange, RETRY_LIMIT)
+                            failed_seises.append(seis)
+                            continue
+
                         # push new data into all consumers that are expecting data for this Seis
                         for consumer in seis.get_consumers():
                             consumer.put(data)
+
+            # remove failed seises outside the main processing loop
+            for seis in failed_seises:
+                try:
+                    self.del_seis(seis)
+                except ValueError:
+                    pass  # already removed
+
+            # if all seises removed, quit
+            if not self._sat:
+                self._sat.quit()
         
-        # send a shutdown signal to all the callback threads
+        # collect consumers and seises under lock, then stop outside lock to avoid deadlock
+        consumers_to_stop = []
         with self._lock:
-            for seis in self._sat:
-                for consumer in seis.get_consumers():
-                    seis.pop_consumer(consumer)
-                    consumer.stop()
-                
+            all_seises = list(self._sat)  # snapshot to avoid mutating during iteration
+            for seis in all_seises:
+                consumers_to_stop.extend(seis.get_consumers())
+                seis._consumers.clear()
                 self._sat.discard(seis)
-                
             self._main_thread = None
+
+        for consumer in consumers_to_stop:
+            consumer.stop()
     
     def get_hist(self,  
         symbol: str,
@@ -464,11 +494,14 @@ class TvDatafeedLive(tvDatafeed.TvDatafeed):
             dataframe with sohlcv as columns. If timeout was specified 
             and expired then False will be returned.
         '''
-        if self._lock.acquire(timeout=timeout) is False:
+        if not self._lock.acquire(timeout=timeout):
             return False
-        data=super().get_hist(symbol, exchange, interval, n_bars, fut_contract, extended_session)
-        self._lock.release()
-        
+
+        try:
+            data=super().get_hist(symbol, exchange, interval, n_bars, fut_contract, extended_session)
+        finally:
+            self._lock.release()
+
         return data
        
     def __del__(self):
