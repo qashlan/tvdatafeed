@@ -12,7 +12,7 @@ from typing import Optional
 
 import pandas as pd
 import requests
-from websocket import create_connection, WebSocket
+from websocket import WebSocketConnectionClosedException, create_connection, WebSocket
 
 from tvDatafeed.config import SIGN_IN_URL, SEARCH_URL, WS_URL, WS_TIMEOUT, RECV_TIMEOUT
 
@@ -37,7 +37,15 @@ class Interval(enum.Enum):
 
 class TvDatafeed:
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    __signin_headers = {'Referer': 'https://www.tradingview.com'}
+    __signin_headers = {
+        'Referer': 'https://www.tradingview.com',
+        'Origin': 'https://www.tradingview.com',
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+    }
     __re_series_data = re.compile(r'"s":\[(.+?)\}\]')
     __re_bar_split = re.compile(r"\[|:|,|\]")
 
@@ -67,21 +75,21 @@ class TvDatafeed:
     def __auth(self, username: Optional[str], password: Optional[str]) -> Optional[str]:
 
         if (username is None or password is None):
-            token = None
+            return None
 
-        else:
-            data = {"username": username,
-                    "password": password,
-                    "remember": "on"}
-            try:
-                response = requests.post(
-                    url=SIGN_IN_URL, data=data, headers=self.__signin_headers)
-                token = response.json()['user']['auth_token']
-            except (requests.RequestException, KeyError, ValueError) as e:
-                logger.error('error while signin: %s', e)
-                token = None
-
-        return token
+        data = {"username": username,
+                "password": password,
+                "remember": "on"}
+        try:
+            session = requests.Session()
+            session.headers.update(self.__signin_headers)
+            # Initial GET to pass CloudFront bot detection
+            session.get("https://www.tradingview.com/", timeout=10)
+            response = session.post(url=SIGN_IN_URL, data=data, timeout=10)
+            return response.json()['user']['auth_token']
+        except (requests.RequestException, KeyError, ValueError) as e:
+            logger.error('error while signin: %s', e)
+            return None
 
     @staticmethod
     def __create_connection() -> WebSocket:
@@ -297,6 +305,9 @@ class TvDatafeed:
 
             raw_data = "\n".join(raw_data_parts)
             return self.__create_df(raw_data, symbol)
+        except WebSocketConnectionClosedException:
+            logger.error("connection lost for %s", symbol)
+            return None
         finally:
             ws.close()
 
