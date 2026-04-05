@@ -70,8 +70,32 @@ class TvDatafeed:
                 "you are using nologin method, data you access may be limited"
             )
 
-        # ws, session, chart_session are now created per get_hist() call
-        # for thread safety (no shared mutable state)
+        self._persistent_ws: Optional[WebSocket] = None
+
+    # ── Persistent connection management ───────────────────────────────────
+
+    def open_connection(self) -> None:
+        """Open a persistent websocket for reuse across multiple get_hist() calls."""
+        self.close_connection()
+        self._persistent_ws = self.__create_connection()
+        self.__send_message(self._persistent_ws, "set_auth_token", [self.token])
+
+    def close_connection(self) -> None:
+        """Close the persistent websocket if open."""
+        if self._persistent_ws is not None:
+            try:
+                self._persistent_ws.close()
+            except Exception:
+                pass
+            self._persistent_ws = None
+
+    def __enter__(self):
+        self.open_connection()
+        return self
+
+    def __exit__(self, *exc):
+        self.close_connection()
+        return False
 
     def __auth(self, username: Optional[str], password: Optional[str]) -> Optional[str]:
 
@@ -223,10 +247,14 @@ class TvDatafeed:
         # Per-call local state for thread safety
         session = self.__generate_id("qs_")
         chart_session = self.__generate_id("cs_")
-        ws = self.__create_connection()
+
+        # Reuse persistent websocket if available, otherwise create per-call
+        own_ws = self._persistent_ws is None
+        ws = self.__create_connection() if own_ws else self._persistent_ws
 
         try:
-            self.__send_message(ws, "set_auth_token", [self.token])
+            if own_ws:
+                self.__send_message(ws, "set_auth_token", [self.token])
             self.__send_message(ws, "chart_create_session", [chart_session, ""])
             self.__send_message(ws, "quote_create_session", [session])
             self.__send_message(
@@ -308,9 +336,20 @@ class TvDatafeed:
             return self.__create_df(raw_data, symbol)
         except WebSocketConnectionClosedException:
             logger.error("connection lost for %s", symbol)
+            if not own_ws:
+                # Persistent connection died — clear it so caller can reconnect
+                self._persistent_ws = None
             return None
         finally:
-            ws.close()
+            if not own_ws:
+                # Clean up sessions on the persistent connection
+                try:
+                    self.__send_message(ws, "quote_delete_session", [session])
+                    self.__send_message(ws, "chart_delete_session", [chart_session])
+                except Exception:
+                    pass
+            else:
+                ws.close()
 
     def search_symbol(self, text: str, exchange: str = '') -> list[dict]:
         url = SEARCH_URL.format(text, exchange)
