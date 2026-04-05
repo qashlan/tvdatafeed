@@ -14,7 +14,8 @@ import pandas as pd
 import requests
 from websocket import WebSocketConnectionClosedException, create_connection, WebSocket
 
-from tvDatafeed.config import SIGN_IN_URL, SEARCH_URL, WS_URL, WS_TIMEOUT, RECV_TIMEOUT
+from tvDatafeed.config import SIGN_IN_URL, SEARCH_URL, WS_URL, WS_TIMEOUT
+from tvDatafeed import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +290,7 @@ class TvDatafeed:
             raw_data_parts: list[str] = []
 
             logger.debug(f"getting data for {symbol}...")
-            deadline = time.monotonic() + RECV_TIMEOUT
+            deadline = time.monotonic() + _cfg.RECV_TIMEOUT
             while time.monotonic() < deadline:
                 try:
                     result = ws.recv()
