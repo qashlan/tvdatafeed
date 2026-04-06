@@ -72,31 +72,36 @@ class TvDatafeed:
             )
 
         self._persistent_ws: Optional[WebSocket] = None
+        self._ws_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._keepalive_thread: Optional[threading.Thread] = None
-        self._keepalive_running = False
 
     # ── Persistent connection management ───────────────────────────────────
 
+    @property
+    def is_connected(self) -> bool:
+        """True if a persistent websocket is open."""
+        return self._persistent_ws is not None
+
     def _keepalive_loop(self) -> None:
         """Send periodic heartbeats to keep the persistent connection alive."""
-        while self._keepalive_running:
+        while not self._stop_event.is_set():
             ws = self._persistent_ws
-            if ws is not None:
+            if ws is None:
+                return
+            with self._ws_lock:
                 try:
                     ws.send("~h~1")
                 except Exception:
-                    break
-            for _ in range(150):  # sleep 15s in 0.1s chunks for fast shutdown
-                if not self._keepalive_running:
                     return
-                time.sleep(0.1)
+            self._stop_event.wait(15.0)
 
     def open_connection(self) -> None:
         """Open a persistent websocket for reuse across multiple get_hist() calls."""
         self.close_connection()
         self._persistent_ws = self.__create_connection()
         self.__send_message(self._persistent_ws, "set_auth_token", [self.token])
-        self._keepalive_running = True
+        self._stop_event.clear()
         self._keepalive_thread = threading.Thread(
             target=self._keepalive_loop, daemon=True
         )
@@ -104,7 +109,7 @@ class TvDatafeed:
 
     def close_connection(self) -> None:
         """Close the persistent websocket if open."""
-        self._keepalive_running = False
+        self._stop_event.set()
         if self._keepalive_thread is not None:
             self._keepalive_thread.join(timeout=2)
             self._keepalive_thread = None
@@ -189,11 +194,11 @@ class TvDatafeed:
     def __create_message(func: str, paramList: list) -> str:
         return TvDatafeed.__prepend_header(TvDatafeed.__construct_message(func, paramList))
 
-    @staticmethod
-    def __send_message(ws: WebSocket, func: str, args: list) -> None:
+    def __send_message(self, ws: WebSocket, func: str, args: list) -> None:
         m = TvDatafeed.__create_message(func, args)
         logger.debug(m)
-        ws.send(m)
+        with self._ws_lock:
+            ws.send(m)
 
     @staticmethod
     def __create_df(raw_data: str, symbol: str) -> Optional[pd.DataFrame]:
@@ -363,10 +368,11 @@ class TvDatafeed:
 
                 # Echo heartbeat pings back to keep the connection alive
                 if result.startswith("~h~"):
-                    try:
-                        ws.send(result)
-                    except Exception:
-                        pass
+                    with self._ws_lock:
+                        try:
+                            ws.send(result)
+                        except Exception:
+                            pass
                     continue
 
                 raw_data_parts.append(result)
