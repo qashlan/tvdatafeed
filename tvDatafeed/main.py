@@ -97,24 +97,6 @@ class TvDatafeed:
                 pass
             self._persistent_ws = None
 
-    def _drain_buffer(self, ws: WebSocket) -> None:
-        """Read and discard any pending messages on the socket."""
-        original_timeout = ws.gettimeout()
-        ws.settimeout(0.1)
-        try:
-            while True:
-                msg = ws.recv()
-                if msg.startswith("~h~"):
-                    with self._ws_lock:
-                        try:
-                            ws.send(msg)
-                        except Exception:
-                            pass
-        except Exception:
-            pass  # timeout or error = buffer is drained
-        finally:
-            ws.settimeout(original_timeout)
-
     def __enter__(self):
         self.open_connection()
         return self
@@ -287,10 +269,6 @@ class TvDatafeed:
         # Reuse persistent websocket if available, otherwise create per-call
         own_ws = self._persistent_ws is None
         ws = self.__create_connection() if own_ws else self._persistent_ws
-
-        # Drain stale messages from previous calls before starting fresh
-        if not own_ws:
-            self._drain_buffer(ws)
 
         try:
             if own_ws:
