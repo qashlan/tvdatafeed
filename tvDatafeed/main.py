@@ -242,6 +242,7 @@ class TvDatafeed:
         n_bars: int = 10,
         fut_contract: Optional[int] = None,
         extended_session: bool = False,
+        _retries: int = 2,
     ) -> Optional[pd.DataFrame]:
         """get historical data
 
@@ -256,6 +257,10 @@ class TvDatafeed:
         Returns:
             pd.Dataframe: dataframe with sohlcv as columns
         """
+        # Save originals before mutation (needed for transparent retry)
+        _orig_symbol = symbol
+        _orig_interval = interval
+
         symbol = self.__format_symbol(
             symbol=symbol, exchange=exchange, contract=fut_contract
         )
@@ -363,10 +368,20 @@ class TvDatafeed:
             raw_data = "\n".join(raw_data_parts)
             return self.__create_df(raw_data, symbol)
         except WebSocketConnectionClosedException:
-            logger.error("connection lost for %s", symbol)
             if not own_ws:
-                # Persistent connection died — clear it so caller can reconnect
                 self._persistent_ws = None
+                if _retries > 0:
+                    logger.debug("connection lost for %s, retrying (%d left)", symbol, _retries)
+                    try:
+                        self.open_connection()
+                    except Exception:
+                        logger.error("reconnect failed for %s", symbol)
+                        return None
+                    return self.get_hist(
+                        _orig_symbol, exchange, _orig_interval, n_bars,
+                        fut_contract, extended_session, _retries=_retries - 1,
+                    )
+            logger.error("connection lost for %s", symbol)
             return None
         finally:
             if own_ws:
