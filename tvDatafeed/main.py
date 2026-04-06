@@ -7,6 +7,7 @@ import logging
 import random
 import re
 import string
+import threading
 import time
 from typing import Optional
 
@@ -71,17 +72,42 @@ class TvDatafeed:
             )
 
         self._persistent_ws: Optional[WebSocket] = None
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_running = False
 
     # ── Persistent connection management ───────────────────────────────────
+
+    def _keepalive_loop(self) -> None:
+        """Send periodic heartbeats to keep the persistent connection alive."""
+        while self._keepalive_running:
+            ws = self._persistent_ws
+            if ws is not None:
+                try:
+                    ws.send("~h~1")
+                except Exception:
+                    break
+            for _ in range(150):  # sleep 15s in 0.1s chunks for fast shutdown
+                if not self._keepalive_running:
+                    return
+                time.sleep(0.1)
 
     def open_connection(self) -> None:
         """Open a persistent websocket for reuse across multiple get_hist() calls."""
         self.close_connection()
         self._persistent_ws = self.__create_connection()
         self.__send_message(self._persistent_ws, "set_auth_token", [self.token])
+        self._keepalive_running = True
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True
+        )
+        self._keepalive_thread.start()
 
     def close_connection(self) -> None:
         """Close the persistent websocket if open."""
+        self._keepalive_running = False
+        if self._keepalive_thread is not None:
+            self._keepalive_thread.join(timeout=2)
+            self._keepalive_thread = None
         if self._persistent_ws is not None:
             try:
                 self._persistent_ws.close()
@@ -331,10 +357,19 @@ class TvDatafeed:
             while time.monotonic() < deadline:
                 try:
                     result = ws.recv()
-                    raw_data_parts.append(result)
                 except (OSError, TimeoutError) as e:
                     logger.error(e)
                     break
+
+                # Echo heartbeat pings back to keep the connection alive
+                if result.startswith("~h~"):
+                    try:
+                        ws.send(result)
+                    except Exception:
+                        pass
+                    continue
+
+                raw_data_parts.append(result)
 
                 if "series_completed" in result:
                     break

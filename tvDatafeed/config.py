@@ -6,7 +6,7 @@ SIGN_IN_URL = "https://www.tradingview.com/accounts/signin/"
 SEARCH_URL = "https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production"
 
 # WebSocket settings
-WS_TIMEOUT = 5
+WS_TIMEOUT = 10
 RECV_TIMEOUT = 30
 
 # Live feed retry settings
