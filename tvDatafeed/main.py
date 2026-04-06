@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+import socket
 import string
 import threading
 import time
@@ -96,6 +97,24 @@ class TvDatafeed:
                 pass
             self._persistent_ws = None
 
+    def _drain_buffer(self, ws: WebSocket) -> None:
+        """Read and discard any pending messages on the socket."""
+        original_timeout = ws.gettimeout()
+        ws.settimeout(0.1)
+        try:
+            while True:
+                msg = ws.recv()
+                if msg.startswith("~h~"):
+                    with self._ws_lock:
+                        try:
+                            ws.send(msg)
+                        except Exception:
+                            pass
+        except Exception:
+            pass  # timeout or error = buffer is drained
+        finally:
+            ws.settimeout(original_timeout)
+
     def __enter__(self):
         self.open_connection()
         return self
@@ -130,6 +149,7 @@ class TvDatafeed:
             WS_URL,
             headers=TvDatafeed.__ws_headers,
             timeout=WS_TIMEOUT,
+            sockopt=[(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)],
         )
         # Drain the server's initial greeting (session_id message) before
         # sending any commands — without this, the first request races with
@@ -268,6 +288,10 @@ class TvDatafeed:
         own_ws = self._persistent_ws is None
         ws = self.__create_connection() if own_ws else self._persistent_ws
 
+        # Drain stale messages from previous calls before starting fresh
+        if not own_ws:
+            self._drain_buffer(ws)
+
         try:
             if own_ws:
                 self.__send_message(ws, "set_auth_token", [self.token])
@@ -367,7 +391,16 @@ class TvDatafeed:
                 self._persistent_ws = None
             return None
         finally:
-            if own_ws:
+            if not own_ws:
+                # Clean up sessions to avoid server-side accumulation
+                try:
+                    self.__send_message(ws, "quote_delete_session", [session])
+                    self.__send_message(ws, "chart_delete_session", [chart_session])
+                except Exception:
+                    pass
+                # Drain delete confirmations and any late responses
+                self._drain_buffer(ws)
+            else:
                 ws.close()
 
     def search_symbol(self, text: str, exchange: str = '') -> list[dict]:
