@@ -391,16 +391,7 @@ class TvDatafeed:
                 self._persistent_ws = None
             return None
         finally:
-            if not own_ws:
-                # Clean up sessions to avoid server-side accumulation
-                try:
-                    self.__send_message(ws, "quote_delete_session", [session])
-                    self.__send_message(ws, "chart_delete_session", [chart_session])
-                except Exception:
-                    pass
-                # Drain delete confirmations and any late responses
-                self._drain_buffer(ws)
-            else:
+            if own_ws:
                 ws.close()
 
     def search_symbol(self, text: str, exchange: str = '') -> list[dict]:
