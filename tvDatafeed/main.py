@@ -73,8 +73,6 @@ class TvDatafeed:
 
         self._persistent_ws: Optional[WebSocket] = None
         self._ws_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._keepalive_thread: Optional[threading.Thread] = None
 
     # ── Persistent connection management ───────────────────────────────────
 
@@ -83,36 +81,14 @@ class TvDatafeed:
         """True if a persistent websocket is open."""
         return self._persistent_ws is not None
 
-    def _keepalive_loop(self) -> None:
-        """Send periodic heartbeats to keep the persistent connection alive."""
-        while not self._stop_event.is_set():
-            ws = self._persistent_ws
-            if ws is None:
-                return
-            with self._ws_lock:
-                try:
-                    ws.send("~h~1")
-                except Exception:
-                    return
-            self._stop_event.wait(15.0)
-
     def open_connection(self) -> None:
         """Open a persistent websocket for reuse across multiple get_hist() calls."""
         self.close_connection()
         self._persistent_ws = self.__create_connection()
         self.__send_message(self._persistent_ws, "set_auth_token", [self.token])
-        self._stop_event.clear()
-        self._keepalive_thread = threading.Thread(
-            target=self._keepalive_loop, daemon=True
-        )
-        self._keepalive_thread.start()
 
     def close_connection(self) -> None:
         """Close the persistent websocket if open."""
-        self._stop_event.set()
-        if self._keepalive_thread is not None:
-            self._keepalive_thread.join(timeout=2)
-            self._keepalive_thread = None
         if self._persistent_ws is not None:
             try:
                 self._persistent_ws.close()
