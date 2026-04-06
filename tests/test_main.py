@@ -138,8 +138,10 @@ class TestGetHistIntegration:
         mock_ws = MagicMock()
         mock_ws_create.return_value = mock_ws
 
-        # Simulate recv() returning data then series_completed
+        # First recv() is consumed by __create_connection (server greeting),
+        # then get_hist's recv loop gets data + series_completed
         mock_ws.recv.side_effect = [
+            '~m~36~m~{"session_id":"abc123"}',  # server greeting
             '{"m":"timescale_update","p":["cs_abc",{"s":[{"i":0,"v":[1609459200,100.0,105.0,99.0,103.0,1000000.0]}]}]}',
             '{"m":"series_completed","p":["cs_abc","s1"]}',
         ]
@@ -160,6 +162,7 @@ class TestGetHistIntegration:
         mock_ws_create.return_value = mock_ws
 
         mock_ws.recv.side_effect = [
+            '~m~36~m~{"session_id":"abc123"}',  # server greeting
             '{"m":"timescale_update","p":["cs_abc",{"s":[{"i":0,"v":[1609459200,50.0,55.0,49.0,53.0,500.0]}]}]}',
             '{"m":"series_completed","p":["cs_abc","s1"]}',
         ]
@@ -176,7 +179,10 @@ class TestGetHistIntegration:
     def test_get_hist_ws_error_returns_none(self, mock_auth, mock_ws_create):
         mock_ws = MagicMock()
         mock_ws_create.return_value = mock_ws
-        mock_ws.recv.side_effect = OSError("connection lost")
+        mock_ws.recv.side_effect = [
+            '~m~36~m~{"session_id":"abc123"}',  # server greeting
+            OSError("connection lost"),
+        ]
 
         tv = TvDatafeed()
         result = tv.get_hist("AAPL", "NASDAQ", n_bars=1)
@@ -191,6 +197,7 @@ class TestGetHistIntegration:
         mock_ws = MagicMock()
         mock_ws_create.return_value = mock_ws
         mock_ws.recv.side_effect = [
+            '~m~36~m~{"session_id":"abc123"}',  # server greeting
             '{"m":"series_completed","p":["cs_abc","s1"]}',
         ]
 
@@ -202,6 +209,7 @@ class TestGetHistIntegration:
 
         mock_ws.reset_mock()
         mock_ws.recv.side_effect = [
+            '~m~36~m~{"session_id":"abc123"}',  # server greeting
             '{"m":"series_completed","p":["cs_abc","s1"]}',
         ]
         tv.get_hist("AAPL", "NASDAQ", n_bars=1)

@@ -119,11 +119,20 @@ class TvDatafeed:
     @staticmethod
     def __create_connection() -> WebSocket:
         logger.debug("creating websocket connection")
-        return create_connection(
+        ws = create_connection(
             WS_URL,
             headers=TvDatafeed.__ws_headers,
             timeout=WS_TIMEOUT,
         )
+        # Drain the server's initial greeting (session_id message) before
+        # sending any commands — without this, the first request races with
+        # the greeting and often fails to parse the response correctly.
+        try:
+            greeting = ws.recv()
+            logger.debug("server greeting: %s", greeting[:120] if greeting else "")
+        except Exception as e:
+            logger.debug("no greeting received: %s", e)
+        return ws
 
     @staticmethod
     def __filter_raw_message(text: str) -> Optional[tuple[str, str]]:
