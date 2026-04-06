@@ -243,6 +243,7 @@ class TvDatafeed:
         fut_contract: Optional[int] = None,
         extended_session: bool = False,
         _retries: int = 2,
+        recv_timeout: Optional[float] = None,
     ) -> Optional[pd.DataFrame]:
         """get historical data
 
@@ -341,7 +342,7 @@ class TvDatafeed:
             raw_data_parts: list[str] = []
 
             logger.debug(f"getting data for {symbol}...")
-            deadline = time.monotonic() + _cfg.RECV_TIMEOUT
+            deadline = time.monotonic() + (recv_timeout if recv_timeout is not None else _cfg.RECV_TIMEOUT)
             while time.monotonic() < deadline:
                 try:
                     result = ws.recv()
@@ -380,6 +381,7 @@ class TvDatafeed:
                     return self.get_hist(
                         _orig_symbol, exchange, _orig_interval, n_bars,
                         fut_contract, extended_session, _retries=_retries - 1,
+                        recv_timeout=recv_timeout,
                     )
             logger.error("connection lost for %s", symbol)
             return None
